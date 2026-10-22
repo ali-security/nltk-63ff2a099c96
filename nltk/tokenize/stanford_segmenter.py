@@ -23,6 +23,7 @@ from nltk.internals import (
     find_jar,
     java,
 )
+from nltk.pathsec import validate_tool_dir, validate_tool_path
 from nltk.tokenize.api import TokenizerI
 
 _stanford_url = "https://nlp.stanford.edu/software"
@@ -199,22 +200,23 @@ class StanfordSegmenter(TokenizerI):
 
     def segment_file(self, input_file_path):
         """ """
+        model, dictionary, sihan = self._validate_model_paths()
         cmd = [
             self._java_class,
             "-loadClassifier",
-            self._model,
+            model,
             "-keepAllWhitespaces",
             self._keep_whitespaces,
             "-textFile",
             input_file_path,
         ]
-        if self._sihan_corpora_dict is not None:
+        if sihan is not None:
             cmd.extend(
                 [
                     "-serDictionary",
-                    self._dict,
+                    dictionary,
                     "-sighanCorporaDict",
-                    self._sihan_corpora_dict,
+                    sihan,
                     "-sighanPostProcessing",
                     self._sihan_post_processing,
                 ]
@@ -244,22 +246,27 @@ class StanfordSegmenter(TokenizerI):
                     _input = _input.encode(encoding)
                 input_fh.write(_input)
 
+            # Validate BEFORE building the command, and build it from the
+            # attributes the guard replaced. Capturing self._model into cmd first
+            # would put the original object there, and a PathLike may resolve to
+            # something else when the child process reads it.
+            model, dictionary, sihan = self._validate_model_paths()
             cmd = [
                 self._java_class,
                 "-loadClassifier",
-                self._model,
+                model,
                 "-keepAllWhitespaces",
                 self._keep_whitespaces,
                 "-textFile",
                 self._input_file_path,
             ]
-            if self._sihan_corpora_dict is not None:
+            if sihan is not None:
                 cmd.extend(
                     [
                         "-serDictionary",
-                        self._dict,
+                        dictionary,
                         "-sighanCorporaDict",
-                        self._sihan_corpora_dict,
+                        sihan,
                         "-sighanPostProcessing",
                         self._sihan_post_processing,
                     ]
@@ -320,6 +327,44 @@ class StanfordSegmenter(TokenizerI):
                     "Multiple approved checksums may be supplied as a comma-separated list."
                 )
 
+    def _validate_model_paths(self):
+        """Refuse model/dictionary paths that escape the NLTK data sandbox.
+
+        These are embedded in the JVM argv (-loadClassifier / -serDictionary /
+        -sighanCorporaDict), which pathsec.open cannot wrap, so they are checked
+        here before the process is spawned (GHSA-8mgp-746c-j5xp).
+
+        Each attribute is replaced with the string the guard returned, and the
+        same strings are RETURNED for the caller to build its argv from. A
+        PathLike may answer differently on every call, and ``validate_path``
+        reads a ``.path`` attribute in preference to ``__fspath__``, so
+        validating the object and then handing the same object to the JVM
+        checked one file and opened another.
+
+        Returning them matters beyond that: a caller that re-reads
+        ``self._model`` after this returns is reading shared mutable state again,
+        so a concurrent write could still swap the value between the check and
+        the argv. Building from the return value keeps the checked value and the
+        used value the same object.
+
+        :return: the validated (model, dictionary, sihan corpora dict) strings,
+            each None when it was unset
+        """
+        validated = []
+        for attribute, label, guard in (
+            ("_model", "model", validate_tool_path),
+            ("_dict", "dictionary", validate_tool_path),
+            # The Sihan corpora dict is a DIRECTORY, so it needs the directory
+            # guard: validate_tool_path requires a regular file.
+            ("_sihan_corpora_dict", "sihan corpora dict", validate_tool_dir),
+        ):
+            value = getattr(self, attribute)
+            if value:
+                value = guard(value, context=f"StanfordSegmenter {label}")
+                setattr(self, attribute, value)
+            validated.append(value)
+        return tuple(validated)
+
     def _execute(self, cmd, verbose=False):
         encoding = self._encoding
         cmd.extend(["-inputEncoding", encoding])
@@ -327,6 +372,7 @@ class StanfordSegmenter(TokenizerI):
         if _options_cmd:
             cmd.extend(["-options", self._options_cmd])
 
+        self._validate_model_paths()
         self._validate_classpath()
 
         stdout, _stderr = java(

@@ -14,6 +14,7 @@ import re
 import unicodedata
 import warnings
 
+from nltk.pathsec import validate_tool_path
 from nltk.tag.api import TaggerI
 
 try:
@@ -121,6 +122,19 @@ class CRFTagger(TaggerI):
         self._feature_cache = {}
 
     def set_model_file(self, model_file):
+        """Load a trained model from ``model_file``.
+
+        ``model_file`` is caller-supplied and pycrfsuite opens it natively, so
+        the path is validated against the NLTK data sandbox first: an
+        outside-root model is refused rather than handed to the native loader
+        (GHSA-8mgp-746c-j5xp). ``pathsec.open`` cannot be used here because the
+        C extension does its own open, so the guard opens the file itself
+        (O_NOFOLLOW, regular, single-linked) and the string it returns is what
+        the loader gets: pycrfsuite calls ``__fspath__`` again, and a PathLike
+        may answer differently each time. A swap after the check is the
+        remaining race.
+        """
+        model_file = validate_tool_path(model_file, context="CRFTagger.set_model_file")
         self._model_file = model_file
         self._tagger.open(self._model_file)
 
@@ -275,11 +289,20 @@ class CRFTagger(TaggerI):
 
         :param train_data: list of annotated sentences.
         :type train_data: list(list(tuple(str,str)))
-        :param model_file: path where the trained model will be written.
+        :param model_file: path where the trained model will be written. It must
+            be inside an allowed NLTK data root (see ``nltk.data.path``); use
+            ``nltk.data.make_staging_dir()`` for a private in-sandbox location.
         :type model_file: str
         """
         if pycrfsuite is None:
             raise ImportError("CRFTagger requires python-crfsuite to be installed.")
+
+        # Caller-supplied destination that pycrfsuite writes natively: refuse an
+        # outside-root or hardlinked target up front (for_write) and hand the
+        # trainer the checked string, not an object that may resolve elsewhere.
+        model_file = validate_tool_path(
+            model_file, context="CRFTagger.train", must_exist=False, for_write=True
+        )
 
         trainer = pycrfsuite.Trainer(verbose=self._verbose)
         trainer.set_params(self._training_options)
